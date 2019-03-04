@@ -40,18 +40,24 @@
 #include <libavutil/mathematics.h>
 #include <libavutil/time.h>
 
-const char *filter_descr = "null";
+const char *filter_descr = "[in]scale=300:100[scl];[in1][scl]overlay=25:25";
 /* other way:
    scale=78:24 [scl]; [scl] transpose=cclock // assumes "[in]" and "[out]" to be input output pads respectively
  */
 static AVFormatContext *liveStreamOutputContext;
 static AVFormatContext *inputFormatContext;
+static AVFormatContext *logoFormatContext;
+
 static AVCodecContext *decoderContext;
 static AVCodecContext *videoCodecContext;
+static AVCodecContext *logoCodecContext;
+
 static AVCodec *videoCodec;
 static AVCodec *audioCodec;
+
 static AVStream *audioStream;
 static AVStream *videoStream;
+
 AVFilterContext *bufferSinkContext;
 AVFilterContext *bufferSourceContext;
 AVFilterContext *bufferSource1Context;
@@ -65,7 +71,24 @@ static int open_input_file(const char *filename)
 {
     int ret;
     AVCodec *dec;
+    AVCodec *logoDec;
 
+//    if((ret = avformat_open_input(&logoFormatContext, "logo.png", NULL, NULL)) < 0)
+//    {
+//        av_log(NULL, AV_LOG_ERROR, "Cannot open logo input file\n");
+//        return ret;
+//    }
+
+//    if ((ret = avformat_find_stream_info(logoFormatContext, NULL)) < 0) {
+//        av_log(NULL, AV_LOG_ERROR, "Cannot find logo stream information\n");
+//        return ret;
+//    }
+
+//    ret = av_find_best_stream(logoFormatContext, AVMEDIA_TYPE_VIDEO, -1, -1, &logoDec, 0);
+//    if (ret < 0) {
+//        av_log(NULL, AV_LOG_ERROR, "Cannot find a video stream in the logo input file\n");
+//        return ret;
+//    }
 
     if ((ret = avformat_open_input(&inputFormatContext, filename, NULL, NULL)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "Cannot open input file\n");
@@ -104,7 +127,7 @@ static int open_input_file(const char *filename)
     videoCodecContext->sample_fmt = AV_SAMPLE_FMT_S16;
     videoCodecContext->width = 1920;
     videoCodecContext->height = 1080;
-    //    videoCodecContext->bit_rate = 1000000;
+    videoCodecContext->bit_rate = 500000;
     videoCodecContext->pix_fmt = AV_PIX_FMT_YUV420P;
     videoCodecContext->profile = FF_PROFILE_H264_MAIN;
     videoCodecContext->level = 41;
@@ -133,6 +156,7 @@ static int init_filters(const char *filters_descr)
     const AVFilter *buffersrc1 = avfilter_get_by_name("buffer");
     const AVFilter *buffersink = avfilter_get_by_name("buffersink");
     AVFilterInOut *outputs = avfilter_inout_alloc();
+    AVFilterInOut *overlayFrameInOut = avfilter_inout_alloc();
     AVFilterInOut *inputs  = avfilter_inout_alloc();
     AVRational time_base = inputFormatContext->streams[videoStreamIndex]->time_base;
     enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE };
@@ -157,12 +181,12 @@ static int init_filters(const char *filters_descr)
         goto end;
     }
 
-//    ret = avfilter_graph_create_filter(&bufferSource1Context, buffersrc1, "overlayFrame",
-//                                       args, NULL, filterGraph);
-//    if (ret < 0) {
-//        av_log(NULL, AV_LOG_ERROR, "Cannot create buffer source\n");
-//        goto end;
-//    }
+    ret = avfilter_graph_create_filter(&bufferSource1Context, buffersrc1, "in1",
+                                       args, NULL, filterGraph);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Cannot create buffer source\n");
+        goto end;
+    }
 
     /* buffer video sink: to terminate the filter chain. */
     ret = avfilter_graph_create_filter(&bufferSinkContext, buffersink, "out",
@@ -193,7 +217,12 @@ static int init_filters(const char *filters_descr)
     outputs->name       = av_strdup("in");
     outputs->filter_ctx = bufferSourceContext;
     outputs->pad_idx    = 0;
-    outputs->next       = NULL;
+    outputs->next       = overlayFrameInOut;
+
+    overlayFrameInOut->name = av_strdup("in1");
+    overlayFrameInOut->filter_ctx = bufferSource1Context;
+    overlayFrameInOut->pad_idx = 0;
+    overlayFrameInOut->next = NULL;
 
     /*
      * The buffer sink input must be connected to the output pad of
@@ -262,6 +291,22 @@ static void display_frame(const AVFrame *frame, AVRational time_base)
         av_log(NULL, AV_LOG_ERROR, "[ERROR] Encode frame -> avcodec_encode_video2()");
     }
 
+    AVRational avTimeBaseQ = {1, AV_TIME_BASE};
+    int64_t ptsTime = av_rescale_q(frame->pts, inputFormatContext->streams[videoStreamIndex]->time_base, avTimeBaseQ);
+    int64_t nowTime = av_gettime() - startTime;
+
+    if((ptsTime > nowTime)) // Important Delay to Read Files at their Native Frame Rate
+    {
+        int64_t sleepTime = ptsTime - nowTime;
+//            sleepTime -= 30000;
+        printf("Sleeping for : %d\n", sleepTime);
+        av_usleep((sleepTime));
+    }
+    else
+    {
+        printf("not sleeping\n");
+    }
+
     if(gotOutput)
     {
         packet.pts = av_rescale_q_rnd(packet.pts, time_base, videoStream->time_base, (AV_ROUND_INF|AV_ROUND_PASS_MINMAX));
@@ -283,15 +328,17 @@ static void display_frame(const AVFrame *frame, AVRational time_base)
 //            lastPts = packet.dts;
 //        }
 
-        AVRational avTimeBaseQ = {1, AV_TIME_BASE};
-        int64_t ptsTime = av_rescale_q(packet.dts, inputFormatContext->streams[videoStreamIndex]->time_base, avTimeBaseQ);
-        int64_t nowTime = av_gettime() - startTime;
 
-        if((ptsTime > nowTime)) // Important Delay to Read Files at their Native Frame Rate
-        {
-            int64_t sleepTime = ptsTime - nowTime;
-            av_usleep((sleepTime));
-        }
+
+//        AVRational avTimeBaseQ = {1, AV_TIME_BASE};
+//        int64_t ptsTime = av_rescale_q(packet.dts, inputFormatContext->streams[videoStreamIndex]->time_base, avTimeBaseQ);
+//        int64_t nowTime = av_gettime() - startTime;
+
+//        if((ptsTime > nowTime)) // Important Delay to Read Files at their Native Frame Rate
+//        {
+//            int64_t sleepTime = ptsTime - nowTime;
+//            av_usleep((sleepTime));
+//        }
 
 
 //        if(videoStream->start_time == AV_NOPTS_VALUE)
@@ -314,6 +361,7 @@ static int initializeLiveStreamOutput()
 {
     int error;
     const char *out_filename = "rtmp://127.0.0.1:1935/live";
+//    const char *out_filename = "rtmp://cdn1.streamencoding.com:1935/demo_live?streamencoding=BrKOb/deneme";
 
     avformat_alloc_output_context2(&liveStreamOutputContext, NULL, "flv", out_filename);
 
@@ -417,7 +465,7 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    error = av_opt_set(videoCodecContext->priv_data, "preset", "superfast", 0);
+    error = av_opt_set(videoCodecContext->priv_data, "preset", "ultrafast", 0);
     if(error < 0)
     {
         perror("[ERROR] av_opt_set preset");
@@ -438,6 +486,23 @@ int main(int argc, char **argv)
     while (1) {
         if ((ret = av_read_frame(inputFormatContext, &packet)) < 0)
             break;
+
+//        AVRational avTimeBaseQ = {1, AV_TIME_BASE};
+//        int64_t ptsTime = av_rescale_q(packet.dts, inputFormatContext->streams[videoStreamIndex]->time_base, avTimeBaseQ);
+//        int64_t nowTime = av_gettime() - startTime;
+
+//        if((ptsTime > nowTime)) // Important Delay to Read Files at their Native Frame Rate
+//        {
+//            int64_t sleepTime = ptsTime - nowTime;
+////            sleepTime -= 30000;
+//            printf("Sleeping for : %d\n", sleepTime);
+//            av_usleep((sleepTime));
+//        }
+//        else
+//        {
+//            printf("not sleeping\n");
+//        }
+
 
         if (packet.stream_index == videoStreamIndex) { // Video Packets
             ret = avcodec_send_packet(decoderContext, &packet);
@@ -460,6 +525,10 @@ int main(int argc, char **argv)
                 /* push the decoded frame into the filtergraph */
                 if (av_buffersrc_add_frame_flags(bufferSourceContext, frame, AV_BUFFERSRC_FLAG_KEEP_REF) < 0) {
                     av_log(NULL, AV_LOG_ERROR, "Error while feeding the filtergraph\n");
+                    break;
+                }
+                if (av_buffersrc_add_frame_flags(bufferSource1Context, frame, AV_BUFFERSRC_FLAG_KEEP_REF) < 0) {
+                    av_log(NULL, AV_LOG_ERROR, "Error while feeding the filtergraph1\n");
                     break;
                 }
 
